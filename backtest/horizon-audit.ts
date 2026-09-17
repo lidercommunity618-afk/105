@@ -1,41 +1,52 @@
 #!/usr/bin/env tsx
 /**
- * Horizon Audit — Variant B
+ * Horizon Audit — Variant B (Phase 4 recalibration)
  *
  * Аудит горизонта паттернов на реальных исторических данных.
- * Загружает 1m-свечи через существующий data-loader (Deriv для forex),
- * ресэмплирует в целевой таймфрейм, прогоняет ВСЕ детекторы на каждой
- * исторической свече и оценивает направленную точность на нескольких
- * горизонтах экспирации (expiryBars).
+ * Загружает 1m-свечи через существующий data-loader (Deriv для forex,
+ * Binance для crypto), ресэмплирует в целевой таймфрейм, прогоняет
+ * ВСЕ детекторы на каждой исторической свече и оценивает направленную
+ * точность на нескольких горизонтах экспирации (expiryBars).
  *
  * Методология (direction-horizon-source-variant-B.md, раздел 3):
- *  1. Хронологическое разбиение train/validation/test 60/20/20.
- *  2. Выбор лучшего expiryBars — ТОЛЬКО по train+validation.
- *  3. Финальная оценка — на отложенной test-выборке.
+ *  1. Хронологическое разбиение: holdout (60/20/20) или walk-forward.
+ *  2. Выбор лучшего expiryBars — ТОЛЬКО по train/validation данным.
+ *  3. Финальная оценка — на отложённых test-данных (holdout) или
+ *     агрегация по fold-level test-наблюдениям (walk-forward).
  *  4. Точный двусторонний биномиальный тест значимости против baseline=0.5
- *     (см. ./significance.ts) — СЛИЯНИЕ (2026-09-16): раньше здесь был
- *     Monte-Carlo permutation-тест (1000 симуляций случайного направления);
- *     заменён на точный биномиальный тест ровно по той причине, по которой
- *     он лучше на малых выборках редких паттернов (Abandoned Baby,
- *     Rising/Falling Three Methods) — Monte-Carlo с 1000 итерациями даёт
- *     грубое разрешение p-value вблизи границы значимости именно там, где
- *     корректность важнее всего; точный тест не имеет этой погрешности.
+ *     (см. ./significance.ts) — формальный критерий, НЕ заменяется Wilson.
  *  5. Минимальный порог числа срабатываний — MIN_SAMPLES_FOR_SIGNIFICANCE
- *     (200, см. ./significance.ts, обоснование мощности теста в
- *     комментарии там же) — СЛИЯНИЕ: до объединения здесь стоял
- *     непроверенный порог 10, который не был обоснован расчётом мощности
- *     и был на порядок ниже.
- *  6. Предупреждение о множественных сравнениях (Holm-Bonferroni,
- *     применяется поверх результатов точного теста, без изменений).
+ *     (200, см. ./significance.ts).
+ *  6. Предупреждение о множественных сравнениях (Holm-Bonferroni).
+ *  7. Градуированный Wilson-критерий: нижняя граница интервала Уилсона
+ *     даёт консервативную оценку надёжности, особенно на малых выборках,
+ *     БЕЗ замены формального теста значимости. Паттерн может пройти
+ *     Wilson-гейт, но не пройти формальный тест — и наоборот.
+ *
+ * Фаза 4 расширения:
+ *  - Пулинг по нескольким инструментам (--symbols=EURUSD,USDJPY,...).
+ *  - Глобальное разбиение по timestamp (не по barIndex внутри одного symbol).
+ *  - Walk-forward режим (--split=walkforward) с purge-зазором между
+ *    train/validation и test каждого fold.
+ *  - Per-symbol breakdown в отчёте.
+ *  - Wilson lower bound и passesWilsonGate в каждой строкке результата.
+ *  - Метаданные пула (инструменты, корреляционное предупреждение).
  *
  * Использование:
+ *   # Holdout, single symbol (обратно совместимо):
  *   npm run backtest:horizon-audit -- --symbol=EURUSD --timeframe=15m \
  *     --from=2026-06-16 --to=2026-09-16
+ *
+ *   # Pooled, walk-forward:
+ *   npm run backtest:horizon-audit -- --symbols=EURUSD,USDJPY,GBPUSD \
+ *     --timeframe=1m --from=2026-06-16 --to=2026-09-16 --split=walkforward
  */
 
 import { loadHistory } from './data-loader';
 import { resample } from './resampler';
 import { binomialSignificanceTest, MIN_SAMPLES_FOR_SIGNIFICANCE } from './significance';
+import { wilsonLowerBound } from '@/lib/wilson';
+import { assignHoldoutPartitions, assignWalkForwardPartitions } from './horizon-partitioning';
 import { detectAllPatterns } from '@/compute/patterns';
 import { computeIndicators } from '@/compute/IndicatorAggregator';
 import { computeStructure } from '@/compute/indicators/trend-structure';
@@ -46,7 +57,7 @@ import type { Candle, Timeframe, PatternName, SignalDirection } from '@/types/do
 // ─── CLI ───────────────────────────────────────────────────────────
 
 interface CliArgs {
-  symbol: string;
+  symbols: string[];
   from: string;
   to: string;
   timeframe: string;
@@ -54,6 +65,10 @@ interface CliArgs {
   windowSize: number;
   minSamples: number;
   significanceAlpha: number;
+  split: 'holdout' | 'walkforward';
+  walkforwardFolds: number;
+  purgeBars: number;
+  wilsonMargin: number;
 }
 
 function parseArgs(): CliArgs {
@@ -65,8 +80,17 @@ function parseArgs(): CliArgs {
       map.set(arg.slice(2, eqIdx), arg.slice(eqIdx + 1));
     }
   }
+  const symbolArg = map.get('symbol');
+  const symbolsArg = map.get('symbols');
+  const symbols = symbolsArg
+    ? symbolsArg.split(',').map((s) => s.trim()).filter(Boolean)
+    : symbolArg
+      ? [symbolArg]
+      : ['EURUSD'];
+
+  const splitArg = map.get('split') ?? 'holdout';
   return {
-    symbol: map.get('symbol') ?? 'EURUSD',
+    symbols,
     from: map.get('from') ?? '2026-06-16',
     to: map.get('to') ?? '2026-09-16',
     timeframe: map.get('timeframe') ?? '15m',
@@ -74,6 +98,10 @@ function parseArgs(): CliArgs {
     windowSize: parseInt(map.get('window') ?? '500', 10),
     minSamples: parseInt(map.get('min-samples') ?? '30', 10),
     significanceAlpha: parseFloat(map.get('alpha') ?? '0.05'),
+    split: splitArg === 'walkforward' ? 'walkforward' : 'holdout',
+    walkForwardFolds: parseInt(map.get('wf-folds') ?? '5', 10),
+    purgeBars: parseInt(map.get('purge-bars') ?? '30', 10),
+    wilsonMargin: parseFloat(map.get('wilson-margin') ?? '0.0'),
   };
 }
 
@@ -121,7 +149,6 @@ const HORIZON_GRIDS: Record<string, number[]> = {
   'mean-reversion': [5, 10, 15, 20],
 };
 
-// Doji и Spinning Top намеренно исключены — нет направленной гипотезы.
 const EXCLUDED_PATTERNS = new Set<PatternName>(['doji', 'spinning-top']);
 
 // ─── Types ─────────────────────────────────────────────────────────
@@ -130,13 +157,22 @@ interface Occurrence {
   patternName: PatternName;
   setupType: string | null;
   direction: SignalDirection;
+  symbolId: string;
   barIndex: number;
-  entryPrice: number;
   time: number;
+  entryPrice: number;
   confidence: number;
   partition: 'train' | 'validation' | 'test';
-  // outcome per expiry: -1 (loss), 0 (timeout), 1 (win)
+  fold: number;
   outcomes: Map<number, number>;
+}
+
+interface PerSymbolStat {
+  symbolId: string;
+  totalOccurrences: number;
+  testCount: number;
+  testDecided: number;
+  testAccuracy: number | null;
 }
 
 interface PatternResult_ {
@@ -153,7 +189,10 @@ interface PatternResult_ {
   baselineStd: number | null;
   pValue: number | null;
   significant: boolean | null;
+  wilsonLowerBound: number | null;
+  passesWilsonGate: boolean | null;
   status: 'ok' | 'insufficient-data' | 'no-detections';
+  perSymbol: PerSymbolStat[];
   perExpiry: {
     expiryBars: number;
     trainValAccuracy: number;
@@ -162,10 +201,21 @@ interface PatternResult_ {
   }[];
 }
 
+interface PoolMeta {
+  symbols: string[];
+  split: 'holdout' | 'walkforward';
+  walkForwardFolds: number;
+  purgeBars: number;
+  wilsonMargin: number;
+  correlationWarning: string;
+  perSymbolCandleCounts: { symbolId: string; candles1m: number; candlesResampled: number }[];
+}
+
 // ─── Core audit ─────────────────────────────────────────────────────
 
 function buildOccurrences(
   candles: Candle[],
+  symbolId: string,
   activeFeatures: PatternName[],
   config: typeof DEFAULT_INDICATOR_CONFIG,
   windowSize: number,
@@ -206,7 +256,7 @@ function buildOccurrences(
       const outcomes = new Map<number, number>();
       for (const expiry of grid) {
         if (i + expiry >= candles.length) {
-          outcomes.set(expiry, 0); // timeout / unavailable
+          outcomes.set(expiry, 0);
           continue;
         }
         const expiryCandle = candles[i + expiry];
@@ -225,11 +275,13 @@ function buildOccurrences(
         patternName: p.name,
         setupType: p.setupType ?? null,
         direction: p.direction,
+        symbolId,
         barIndex: i,
-        entryPrice: entryCandle.close,
         time: entryCandle.time,
+        entryPrice: entryCandle.close,
         confidence: p.confidence,
-        partition: 'train', // assigned later
+        partition: 'train',
+        fold: 0,
         outcomes,
       });
     }
@@ -238,30 +290,24 @@ function buildOccurrences(
   return occurrences;
 }
 
-function assignPartitions(occurrences: Occurrence[], totalBars: number): void {
-  const trainEnd = Math.floor(totalBars * 0.6);
-  const valEnd = Math.floor(totalBars * 0.8);
-  for (const o of occurrences) {
-    if (o.barIndex < trainEnd) o.partition = 'train';
-    else if (o.barIndex < valEnd) o.partition = 'validation';
-    else o.partition = 'test';
-  }
-}
+// ─── Accuracy computation ──────────────────────────────────────────
+// Partitioning functions (assignHoldoutPartitions, assignWalkForwardPartitions)
+// are imported from ./horizon-partitioning.ts — extracted for testability.
 
 function accuracyForExpiry(
   occs: Occurrence[],
   expiry: number,
-): { accuracy: number; decided: number } {
+): { accuracy: number; decided: number; wins: number } {
   let wins = 0;
   let decided = 0;
   for (const o of occs) {
     const out = o.outcomes.get(expiry);
     if (out === undefined) continue;
-    if (out === 0) continue; // timeout excluded from denominator
+    if (out === 0) continue;
     decided++;
     if (out === 1) wins++;
   }
-  return { accuracy: decided > 0 ? wins / decided : 0, decided };
+  return { accuracy: decided > 0 ? wins / decided : 0, decided, wins };
 }
 
 function selectBestExpiry(
@@ -282,12 +328,6 @@ function selectBestExpiry(
   return { bestExpiry, bestAccuracy };
 }
 
-// СЛИЯНИЕ (2026-09-16): Monte-Carlo permutation-тест baselineTest() удалён —
-// заменён на точный биномиальный тест binomialSignificanceTest() из
-// ./significance.ts (см. точку вызова ниже и header-комментарий файла).
-// mulberry32 (seeded PRNG) больше не используется этим модулем — удалён
-// вместе с функцией, которую он обслуживал.
-
 function holmBonferroni(
   results: PatternResult_[],
   alpha: number,
@@ -306,26 +346,47 @@ function holmBonferroni(
 
 function generateMarkdown(
   args: CliArgs,
-  candles1mCount: number,
-  candlesCount: number,
+  poolMeta: PoolMeta,
+  candles1mTotal: number,
+  candlesTotal: number,
   results: PatternResult_[],
   dateRange: { from: string; to: string },
 ): string {
   const lines: string[] = [];
-  lines.push(`# Horizon Audit — ${args.symbol} ${args.timeframe}`);
+  const symbolsStr = args.symbols.join(', ');
+  lines.push(`# Horizon Audit — ${symbolsStr} ${args.timeframe}`);
   lines.push('');
   lines.push(`> Сгенерировано: ${new Date().toISOString()}`);
   lines.push(`> Период: ${dateRange.from} → ${dateRange.to}`);
-  lines.push(`> Источник: Deriv WebSocket (1m candles → resampled to ${args.timeframe})`);
-  lines.push(`> Разбиение: train 60% / validation 20% / test 20% (хронологическое)`);
+  lines.push(`> Инструменты (пул): ${symbolsStr}`);
+  lines.push(`> Источник: Deriv WebSocket / Binance (1m candles → resampled to ${args.timeframe})`);
+  if (args.split === 'walkforward') {
+    lines.push(`> Разбиение: walk-forward, ${args.walkForwardFolds} folds, purge ${args.purgeBars} bars`);
+  } else {
+    lines.push(`> Разбиение: train 60% / validation 20% / test 20% (хронологическое, глобальное по timestamp)`);
+  }
   lines.push(`> Минимальный порог (train+validation): ${args.minSamples} срабатываний`);
   lines.push(`> Минимальный порог для теста значимости (test-выборка): ${MIN_SAMPLES_FOR_SIGNIFICANCE} решённых исходов`);
   lines.push(`> Значимость: точный двусторонний биномиальный тест против baseline=0.5, с поправкой Holm-Bonferroni, α = ${args.significanceAlpha}`);
+  lines.push(`> Wilson-критерий: нижняя граница 95% интервала Уилсона ≥ ${(0.5 + args.wilsonMargin).toFixed(3)} (margin=${args.wilsonMargin})`);
   lines.push('');
-  lines.push(`**Загружено**: ${candles1mCount} 1m свечей, ${candlesCount} ${args.timeframe} свечей после ресэмплинга.`);
+  lines.push(`**Загружено**: ${candles1mTotal} 1m свечей (суммарно по пулу), ${candlesTotal} ${args.timeframe} свечей после ресэмплинга.`);
+  lines.push('');
+
+  // Pool metadata
+  lines.push(`## Метаданные пула`);
+  lines.push('');
+  lines.push(`| Инструмент | 1m свечей | ${args.timeframe} свечей |`);
+  lines.push('|---|---|---|');
+  for (const p of poolMeta.perSymbolCandleCounts) {
+    lines.push(`| ${p.symbolId} | ${p.candles1m} | ${p.candlesResampled} |`);
+  }
+  lines.push('');
+  lines.push(`> **Предупреждение о корреляции**: ${poolMeta.correlationWarning}`);
   lines.push('');
 
   const significantCount = results.filter((r) => r.significant === true).length;
+  const wilsonPassCount = results.filter((r) => r.passesWilsonGate === true).length;
   const insufficientCount = results.filter((r) => r.status === 'insufficient-data').length;
   const noDetectionCount = results.filter((r) => r.status === 'no-detections').length;
 
@@ -333,16 +394,27 @@ function generateMarkdown(
   lines.push('');
   lines.push(`- Паттернов в сетке: ${results.length}`);
   lines.push(`- Статистически значимых (после Holm-Bonferroni): **${significantCount}**`);
+  lines.push(`- Прошли Wilson-гейт: ${wilsonPassCount}`);
   lines.push(`- Недостаточно данных: ${insufficientCount}`);
   lines.push(`- Нет срабатываний: ${noDetectionCount}`);
   lines.push('');
-  lines.push(`> **Предупреждение о множественных сравнениях**: ${results.length} паттернов × несколько горизонтов = сотни комбинаций. Лучший expiryBars выбран по train+validation, финальная оценка — на отложенной test-выборке. Значимость проверена против random baseline с коррекцией Holm-Bonferroni. Тем не менее, на 3 месяцах данных (~8600 15m баров) статистическая мощность ограничена — результаты предварительные.`);
-  lines.push('');
+
+  const bothPass = results.filter((r) => r.significant === true && r.passesWilsonGate === true).length;
+  const sigOnly = results.filter((r) => r.significant === true && r.passesWilsonGate !== true).length;
+  const wilsonOnly = results.filter((r) => r.significant !== true && r.passesWilsonGate === true).length;
+  if (bothPass + sigOnly + wilsonOnly > 0) {
+    lines.push(`### Пересечение критериев`);
+    lines.push('');
+    lines.push(`- Прошли оба (формальный + Wilson): ${bothPass}`);
+    lines.push(`- Только формальный тест: ${sigOnly}`);
+    lines.push(`- Только Wilson-гейт: ${wilsonOnly}`);
+    lines.push('');
+  }
 
   lines.push(`## Результаты по паттернам`);
   lines.push('');
-  lines.push('| Паттерн | Setup | Всего | Train+Val | Test | Лучший expiry | Test accuracy | Baseline mean | p-value | Значим | Статус |');
-  lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
+  lines.push('| Паттерн | Setup | Всего | Train+Val | Test | Лучший expiry | Test acc | p-value | Значим | Wilson LB | Wilson OK | Статус |');
+  lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|');
 
   for (const r of results) {
     const setup = r.setupType ?? '—';
@@ -351,14 +423,31 @@ function generateMarkdown(
     const tc = r.testCount;
     const exp = r.bestExpiryBars ?? '—';
     const acc = r.testAccuracy !== null ? `${(r.testAccuracy * 100).toFixed(1)}%` : '—';
-    const bmean = r.baselineMean !== null ? `${(r.baselineMean * 100).toFixed(1)}%` : '—';
     const pv = r.pValue !== null ? r.pValue.toFixed(4) : '—';
     const sig = r.significant === true ? 'да' : r.significant === false ? 'нет' : '—';
+    const wlb = r.wilsonLowerBound !== null ? `${(r.wilsonLowerBound * 100).toFixed(1)}%` : '—';
+    const wok = r.passesWilsonGate === true ? 'да' : r.passesWilsonGate === false ? 'нет' : '—';
     const status = r.status === 'ok' ? 'OK' : r.status === 'insufficient-data' ? 'недостаточно данных' : 'нет срабатываний';
-    lines.push(`| ${r.patternName} | ${setup} | ${total} | ${tv} | ${tc} | ${exp} | ${acc} | ${bmean} | ${pv} | ${sig} | ${status} |`);
+    lines.push(`| ${r.patternName} | ${setup} | ${total} | ${tv} | ${tc} | ${exp} | ${acc} | ${pv} | ${sig} | ${wlb} | ${wok} | ${status} |`);
   }
 
+  // Per-symbol breakdown
   lines.push('');
+  lines.push(`## Разбивка по инструментам`);
+  lines.push('');
+  for (const r of results) {
+    if (r.perSymbol.length === 0) continue;
+    lines.push(`### ${r.patternName}${r.setupType ? ` (${r.setupType})` : ''}`);
+    lines.push('');
+    lines.push('| Инструмент | Всего | Test | Test decided | Test accuracy |');
+    lines.push('|---|---|---|---|---|');
+    for (const ps of r.perSymbol) {
+      const psAcc = ps.testAccuracy !== null ? `${(ps.testAccuracy * 100).toFixed(1)}%` : '—';
+      lines.push(`| ${ps.symbolId} | ${ps.totalOccurrences} | ${ps.testCount} | ${ps.testDecided} | ${psAcc} |`);
+    }
+    lines.push('');
+  }
+
   lines.push(`## Детализация по горизонтам`);
   lines.push('');
 
@@ -400,55 +489,79 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`\nHorizon Audit: ${args.symbol} ${args.timeframe} ${args.from} → ${args.to}`);
-  console.log(`Loading 1m history via Deriv...`);
+  console.log(`\nHorizon Audit: ${args.symbols.join(', ')} ${args.timeframe} ${args.from} → ${args.to}`);
+  console.log(`Split mode: ${args.split}${args.split === 'walkforward' ? `, ${args.walkForwardFolds} folds, purge=${args.purgeBars} bars` : ''}`);
 
-  const candles1m = await loadHistory({ symbol: args.symbol, fromMs, toMs });
-  console.log(`Loaded ${candles1m.length} 1m candles`);
-
-  if (candles1m.length < 500) {
-    console.error('Not enough 1m candles for horizon audit (need at least 500)');
-    process.exit(1);
-  }
-
-  const candles = resample(candles1m, timeframe);
-  console.log(`Resampled to ${timeframe}: ${candles.length} candles`);
-
-  if (candles.length < 200) {
-    console.error('Not enough resampled candles for horizon audit (need at least 200)');
-    process.exit(1);
-  }
-
-  // All pattern features (exclude doji/spinning-top from directional analysis)
+  // Load history for each symbol in the pool
   const patternFeatures = ALL_FEATURES.filter(
     (f): f is PatternName =>
       HORIZON_GRIDS[f as string] !== undefined && !EXCLUDED_PATTERNS.has(f as PatternName),
   );
 
   const config = { ...DEFAULT_INDICATOR_CONFIG };
-
   const maxExpiry = Math.max(...Object.values(HORIZON_GRIDS).flat());
-  console.log(`Max expiry: ${maxExpiry} bars. Running detectors on ${candles.length - maxExpiry - args.windowSize} bars...`);
 
-  const occurrences = buildOccurrences(
-    candles,
-    patternFeatures,
-    config,
-    args.windowSize,
-    maxExpiry,
-  );
+  const allOccurrences: Occurrence[] = [];
+  const perSymbolCandleCounts: PoolMeta['perSymbolCandleCounts'] = [];
+  let totalCandles1m = 0;
+  let totalCandlesResampled = 0;
 
-  assignPartitions(occurrences, candles.length);
+  for (const symbolId of args.symbols) {
+    console.log(`\nLoading 1m history for ${symbolId}...`);
+    const candles1m = await loadHistory({ symbol: symbolId, fromMs, toMs });
+    console.log(`  ${symbolId}: ${candles1m.length} 1m candles`);
 
-  console.log(`Total occurrences: ${occurrences.length}`);
-  const trainVal = occurrences.filter((o) => o.partition === 'train' || o.partition === 'validation');
-  const test = occurrences.filter((o) => o.partition === 'test');
+    if (candles1m.length < 500) {
+      console.warn(`  ${symbolId}: skipping — not enough 1m candles (need at least 500)`);
+      perSymbolCandleCounts.push({ symbolId, candles1m: candles1m.length, candlesResampled: 0 });
+      continue;
+    }
+
+    const candles = resample(candles1m, timeframe);
+    console.log(`  ${symbolId}: ${candles.length} ${timeframe} candles after resampling`);
+
+    if (candles.length < 200) {
+      console.warn(`  ${symbolId}: skipping — not enough resampled candles (need at least 200)`);
+      perSymbolCandleCounts.push({ symbolId, candles1m: candles1m.length, candlesResampled: candles.length });
+      continue;
+    }
+
+    perSymbolCandleCounts.push({ symbolId, candles1m: candles1m.length, candlesResampled: candles.length });
+    totalCandles1m += candles1m.length;
+    totalCandlesResampled += candles.length;
+
+    console.log(`  ${symbolId}: running detectors on ${candles.length - maxExpiry - args.windowSize} bars...`);
+    const occs = buildOccurrences(candles, symbolId, patternFeatures, config, args.windowSize, maxExpiry);
+    console.log(`  ${symbolId}: ${occs.length} occurrences`);
+    allOccurrences.push(...occs);
+  }
+
+  if (allOccurrences.length === 0) {
+    console.error('No occurrences detected across any symbol. Exiting.');
+    process.exit(1);
+  }
+
+  // Partition
+  if (args.split === 'walkforward') {
+    const timeframeSeconds: Record<Timeframe, number> = {
+      '1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400,
+    };
+    const purgeSeconds = args.purgeBars * timeframeSeconds[timeframe];
+    assignWalkForwardPartitions(allOccurrences, args.walkForwardFolds, purgeSeconds);
+    console.log(`\nWalk-forward: ${args.walkForwardFolds} folds, purge ${args.purgeBars} bars (${purgeSeconds}s)`);
+  } else {
+    assignHoldoutPartitions(allOccurrences);
+  }
+
+  const trainVal = allOccurrences.filter((o) => o.partition === 'train' || o.partition === 'validation');
+  const test = allOccurrences.filter((o) => o.partition === 'test');
+  console.log(`\nTotal occurrences: ${allOccurrences.length}`);
   console.log(`Train+Validation: ${trainVal.length}, Test: ${test.length}`);
 
   // Group by pattern + setupType
   const groupKey = (o: Occurrence) => `${o.patternName}|${o.setupType ?? ''}`;
   const groups = new Map<string, Occurrence[]>();
-  for (const o of occurrences) {
+  for (const o of allOccurrences) {
     const key = groupKey(o);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(o);
@@ -464,6 +577,25 @@ async function main(): Promise<void> {
     const tv = groupOccs.filter((o) => o.partition !== 'test');
     const tc = groupOccs.filter((o) => o.partition === 'test');
 
+    // Per-symbol stats
+    const symbolMap = new Map<string, Occurrence[]>();
+    for (const o of groupOccs) {
+      if (!symbolMap.has(o.symbolId)) symbolMap.set(o.symbolId, []);
+      symbolMap.get(o.symbolId)!.push(o);
+    }
+    const perSymbol: PerSymbolStat[] = [];
+    for (const [symId, symOccs] of symbolMap) {
+      const symTest = symOccs.filter((o) => o.partition === 'test');
+      perSymbol.push({
+        symbolId: symId,
+        totalOccurrences: symOccs.length,
+        testCount: symTest.length,
+        testDecided: 0,
+        testAccuracy: null,
+      });
+    }
+    perSymbol.sort((a, b) => b.totalOccurrences - a.totalOccurrences);
+
     const result: PatternResult_ = {
       patternName: patternName as PatternName,
       setupType,
@@ -478,7 +610,10 @@ async function main(): Promise<void> {
       baselineStd: null,
       pValue: null,
       significant: null,
+      wilsonLowerBound: null,
+      passesWilsonGate: null,
       status: 'no-detections',
+      perSymbol,
       perExpiry: [],
     };
 
@@ -489,7 +624,6 @@ async function main(): Promise<void> {
 
     if (tv.length < args.minSamples) {
       result.status = 'insufficient-data';
-      // Still compute perExpiry for reference
       for (const expiry of grid) {
         const tvAcc = accuracyForExpiry(tv, expiry);
         const tAcc = accuracyForExpiry(tc, expiry);
@@ -504,7 +638,6 @@ async function main(): Promise<void> {
       continue;
     }
 
-    // Per-expiry stats
     for (const expiry of grid) {
       const tvAcc = accuracyForExpiry(tv, expiry);
       const tAcc = accuracyForExpiry(tc, expiry);
@@ -516,7 +649,6 @@ async function main(): Promise<void> {
       });
     }
 
-    // Select best expiry on train+validation
     const best = selectBestExpiry(tv, grid);
     if (!best) {
       result.status = 'insufficient-data';
@@ -532,14 +664,26 @@ async function main(): Promise<void> {
       ? Math.round(testResult.accuracy * testResult.decided)
       : 0;
 
+    // Wilson lower bound (graduated reliability criterion)
+    if (testResult.decided > 0) {
+      result.wilsonLowerBound = wilsonLowerBound(result.testWinCount, testResult.decided);
+      result.passesWilsonGate = result.wilsonLowerBound >= 0.5 + args.wilsonMargin;
+    }
+
+    // Update per-symbol test stats for the best expiry
+    for (const ps of result.perSymbol) {
+      const symTest = symbolMap.get(ps.symbolId)!.filter((o) => o.partition === 'test');
+      const symAcc = accuracyForExpiry(symTest, best.bestExpiry);
+      ps.testDecided = symAcc.decided;
+      ps.testAccuracy = symAcc.decided > 0 ? symAcc.accuracy : null;
+    }
+
     if (testResult.decided < MIN_SAMPLES_FOR_SIGNIFICANCE) {
       result.status = 'insufficient-data';
       results.push(result);
       continue;
     }
 
-    // Точный двусторонний биномиальный тест значимости против baseline=0.5
-    // (СЛИЯНИЕ 2026-09-16, см. header-комментарий файла и ./significance.ts).
     const sig = binomialSignificanceTest(
       result.testWinCount,
       testResult.decided,
@@ -547,16 +691,14 @@ async function main(): Promise<void> {
       args.significanceAlpha,
     );
     result.baselineMean = sig.baseline;
-    result.baselineStd = null; // не применимо для точного теста (не было Monte-Carlo распределения)
+    result.baselineStd = null;
     result.pValue = sig.pValue;
     result.status = 'ok';
     results.push(result);
   }
 
-  // Holm-Bonferroni correction
   holmBonferroni(results, args.significanceAlpha);
 
-  // Sort results: significant first, then by test accuracy
   results.sort((a, b) => {
     if (a.significant === true && b.significant !== true) return -1;
     if (b.significant === true && a.significant !== true) return 1;
@@ -565,8 +707,22 @@ async function main(): Promise<void> {
     return bAcc - aAcc;
   });
 
-  // Generate reports
-  const md = generateMarkdown(args, candles1m.length, candles.length, results, {
+  // Correlation warning
+  const correlationWarning = args.symbols.length > 1
+    ? `Пул содержит ${args.symbols.length} инструментов. Корреляция между инструментами (особенно forex-парами с общей валютой) может завышать эффективный размер выборки. Для строгого учёта использовать кластерные стандартные ошибки или эффективный размер выборки. Текущая реализация НЕ корректирует p-value на внутрикластерную корреляцию — p-value интерпретируется как per-observation, не per-cluster.`
+    : 'Один инструмент — коррекция не требуется.';
+
+  const poolMeta: PoolMeta = {
+    symbols: args.symbols,
+    split: args.split,
+    walkForwardFolds: args.walkForwardFolds,
+    purgeBars: args.purgeBars,
+    wilsonMargin: args.wilsonMargin,
+    correlationWarning,
+    perSymbolCandleCounts,
+  };
+
+  const md = generateMarkdown(args, poolMeta, totalCandles1m, totalCandlesResampled, results, {
     from: args.from,
     to: args.to,
   });
@@ -575,7 +731,8 @@ async function main(): Promise<void> {
   const path = await import('node:path');
   await fs.mkdir(args.outputDir, { recursive: true });
 
-  const baseName = `horizon-audit-${args.symbol}-${args.timeframe}-${args.from}-${args.to}`;
+  const symbolsSlug = args.symbols.join('-');
+  const baseName = `horizon-audit-${symbolsSlug}-${args.timeframe}-${args.split}-${args.from}-${args.to}`;
   const mdPath = path.join(args.outputDir, `${baseName}.md`);
   const jsonPath = path.join(args.outputDir, `${baseName}.json`);
 
@@ -584,18 +741,23 @@ async function main(): Promise<void> {
     jsonPath,
     JSON.stringify({
       meta: {
-        symbol: args.symbol,
+        symbols: args.symbols,
         timeframe: args.timeframe,
         from: args.from,
         to: args.to,
-        candles1m: candles1m.length,
-        candlesResampled: candles.length,
+        split: args.split,
+        walkForwardFolds: args.walkForwardFolds,
+        purgeBars: args.purgeBars,
+        wilsonMargin: args.wilsonMargin,
+        candles1mTotal,
+        candlesResampledTotal: totalCandlesResampled,
         windowSize: args.windowSize,
         minSamples: args.minSamples,
         minSamplesForSignificance: MIN_SAMPLES_FOR_SIGNIFICANCE,
         alpha: args.significanceAlpha,
         generatedAt: new Date().toISOString(),
       },
+      poolMeta,
       results: results.map((r) => ({
         patternName: r.patternName,
         setupType: r.setupType,
@@ -610,7 +772,10 @@ async function main(): Promise<void> {
         baselineStd: r.baselineStd,
         pValue: r.pValue,
         significant: r.significant,
+        wilsonLowerBound: r.wilsonLowerBound,
+        passesWilsonGate: r.passesWilsonGate,
         status: r.status,
+        perSymbol: r.perSymbol,
         perExpiry: r.perExpiry,
       })),
     }, null, 2),
@@ -620,12 +785,13 @@ async function main(): Promise<void> {
   console.log(`\nReport saved: ${mdPath}`);
   console.log(`JSON saved: ${jsonPath}`);
 
-  // Summary to console
   const sig = results.filter((r) => r.significant === true);
+  const wilsonPass = results.filter((r) => r.passesWilsonGate === true);
   const insuf = results.filter((r) => r.status === 'insufficient-data');
   console.log(`\n=== Summary ===`);
   console.log(`Patterns evaluated: ${results.length}`);
   console.log(`Significant (Holm-Bonferroni α=${args.significanceAlpha}): ${sig.length}`);
+  console.log(`Wilson gate passed: ${wilsonPass.length}`);
   console.log(`Insufficient data: ${insuf.length}`);
   if (sig.length > 0) {
     console.log(`\nSignificant patterns:`);
@@ -633,7 +799,17 @@ async function main(): Promise<void> {
       console.log(
         `  ${r.patternName}${r.setupType ? ` (${r.setupType})` : ''}: ` +
         `expiry=${r.bestExpiryBars}, accuracy=${((r.testAccuracy ?? 0) * 100).toFixed(1)}%, ` +
-        `baseline=${((r.baselineMean ?? 0) * 100).toFixed(1)}%, p=${r.pValue?.toFixed(4)}`,
+        `p=${r.pValue?.toFixed(4)}, wilsonLB=${r.wilsonLowerBound !== null ? (r.wilsonLowerBound * 100).toFixed(1) + '%' : '—'}`,
+      );
+    }
+  }
+  if (wilsonPass.length > 0) {
+    console.log(`\nWilson gate passed:`);
+    for (const r of wilsonPass) {
+      console.log(
+        `  ${r.patternName}${r.setupType ? ` (${r.setupType})` : ''}: ` +
+        `wilsonLB=${r.wilsonLowerBound !== null ? (r.wilsonLowerBound * 100).toFixed(1) + '%' : '—'}, ` +
+        `significant=${r.significant}`,
       );
     }
   }

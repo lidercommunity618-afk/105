@@ -9,6 +9,8 @@ import {
   RELIABILITY_MULTIPLIER_MAX,
 } from './pattern-categories';
 
+export { wilsonLowerBound } from './wilson';
+
 // Этап 2 плана калибровки ("КАЛИБРОВКА" + "АНАЛИТИКА ПО ФАКТОРАМ" →
 // самообучение): раньше PATTERN_RELIABILITY_MULTIPLIER правился вручную —
 // кто-то смотрел на таблицу "АНАЛИТИКА ПО ФАКТОРАМ" и вписывал число в
@@ -98,15 +100,9 @@ function clamp(value: number, min: number, max: number): number {
 // НЕ меняется — пользователь по-прежнему видит настоящий наблюдаемый
 // винрейт; консервативной делается только внутренняя оценка, на которую
 // опирается РЕШЕНИЕ поменять множитель.
-export function wilsonLowerBound(wins: number, n: number, z: number = 1.96): number {
-  if (n <= 0) return 0;
-  const phat = wins / n;
-  const z2 = z * z;
-  const denominator = 1 + z2 / n;
-  const centre = phat + z2 / (2 * n);
-  const margin = z * Math.sqrt((phat * (1 - phat) + z2 / (4 * n)) / n);
-  return Math.max(0, (centre - margin) / denominator);
-}
+// wilsonLowerBound moved to ./wilson.ts and re-exported above —
+// the comment block that was here explained its rationale; see wilson.ts
+// for the implementation and the re-export at the top of this file.
 
 /**
  * `breakevenWinRate` обязателен намеренно (без дефолта на 0.5) — чтобы
