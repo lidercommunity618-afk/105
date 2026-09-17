@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer base {
+  /* Затемнение ценовой шкалы (правая колонка) и временной шкалы (нижняя
+     строка). Lightweight-charts v5 заливает canvas шкал непрозрачным
+     фоном графика (#23283b) через globalCompositeOperation='copy', что
+     полностью перекрывает background-color родительского td. Поэтому
+     поверх canvas (z-index 1 и 2) накладываем полупрозрачный тёмный слой
+     с z-index 3. pointer-events:none — чтобы не блокировать клики. */
+  .tv-lightweight-charts table > tbody > tr:first-child > td:last-child > div,
+  .tv-lightweight-charts table > tbody > tr:last-child > td > div {
+    position: relative;
+  }
+
+  .tv-lightweight-charts table > tbody > tr:first-child > td:last-child > div::after,
+  .tv-lightweight-charts table > tbody > tr:last-child > td > div::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(14, 22, 33, 0.4);
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    @apply bg-base-950 text-base-100 antialiased;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    touch-action: manipulation;
+  }
+
+  /* Scrollbar styling for the terminal aesthetic */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-base-700;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-base-600;
+  }
+
+  input[type='number']::-webkit-inner-spin-button,
+  input[type='number']::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type='number'] {
+    -moz-appearance: textfield;
+  }
+}

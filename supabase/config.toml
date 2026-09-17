@@ -1,0 +1,14 @@
+[functions.proxy-gemini]
+verify_jwt = true
+
+[functions.proxy-finnhub]
+verify_jwt = true
+
+[functions.proxy-twelvedata]
+verify_jwt = true
+
+[functions.proxy-yahoo]
+verify_jwt = true
+
+[functions.delete-all-signals]
+verify_jwt = true

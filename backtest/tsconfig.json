@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.app.json",
+  "compilerOptions": {
+    "composite": true,
+    "types": ["node"],
+    "baseUrl": "..",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  }
+}
